@@ -40,7 +40,7 @@ To clean a device via service principal scheduled task
 
 # Command Line
 
-The script can be execute via command line for all options listed in the screen shot above. Just make sure to include -Operation with desired switch (Verify, VerifyDisabledDevices, DisableDevices, CleanDisabledDevices, CleanDevices)
+The script can be executed via command line for all options listed in the screen shot above. Just make sure to include -Operation with the desired switch (Verify, VerifyDisabledDevices, DisableDevices, CleanDisabledDevices, CleanDevices)
 
 # Logging
 
