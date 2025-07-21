@@ -27,7 +27,7 @@ Executing as a single use, you are presented with a pop-up of options to select 
 
 # Device Code Flow Execution
 
-.\EntraAdDeviceCleanup.ps1 -Operation Verify -UseDeviceCode -ClientID "Your-Client-Id" -TenantId "You-Tenant-Id"
+.\EntraAdDeviceCleanup.ps1 -Operation Verify -Threshold 90 -UseDeviceCode -ClientID "Your-Client-Id" -TenantId "You-Tenant-Id"
 
 # Service Principal Execution
 This is used for an automated scheduled task. When wanting to perform a clean you must use the -Force switch in the command line as I am asking for confirmation on removal during interactive execution and -force bypasses that.
