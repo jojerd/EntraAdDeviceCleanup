@@ -18,8 +18,55 @@ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
 AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.#>
+SOFTWARE.
 
+.SYNOPSIS
+    Entra AD Device Cleanup Script
+
+.DESCRIPTION
+    This script provides functionality to manage stale devices in Entra Active Directory (Azure AD).
+
+
+.PARAMETER
+    ThresholdDays
+    Specifies the period of the last login.
+    Note: The default value is 90 days if this parameter is not configured.
+
+.PARAMETER
+    Verify
+    Verifies the affected devices that will be deleted when running the PowerShell with 'CleanDevices' parameter.
+
+.PARAMETER
+    VerifyDisabledDevices
+    Verifies disabled devices that will be deleted when running the PowerShell with 'CleanDisabledDevices' parameter.
+
+.PARAMETER
+    DisableDevices
+    Disables the stale devices as per the configured threshold.
+
+.PARAMETER
+    CleanDisabledDevices
+    Removes the stale disabled devices as per the configured threshold.
+
+.PARAMETER
+    CleanDevices
+    Removed the stale devices as per the configured threshold.
+
+.Example Device Code Flow
+    .\EntraAdDeviceCleanup.ps1 -Operation Verify -Threshold 90 -UseDeviceCode -ClientId "your-client-id" -TenantId "your-tenant-id"
+
+    This example connects to Microsoft Graph using device code flow and verifies stale devices.
+
+.Example Service Principal Flow
+    .\EntraAdDeviceCleanup.ps1 -Operation DisableDevices -Threshold 90 -ClientId "your-client-id" -TenantId "your-tenant-id" -ClientSecret "your-client-secret"
+
+    This example connects to Microsoft Graph using service principal and disables stale devices.
+
+    .\EntraAdDeviceCleanup.ps1 -Operation CleanDevices -Force -threshold 90 -ClientId "Your-Client-Id" -TenantId "Your-Tenant-Id" -ClientSecret "Your-Client-Secret"
+
+    This example connects to Microsoft Graph using service principal and removes stale devices without confirmation.
+
+#>
 [CmdletBinding(DefaultParameterSetName = 'GUI')]
 param(
     [Parameter(ParameterSetName = 'CommandLine', Mandatory)]
@@ -68,6 +115,7 @@ Function Show-Header {
     Write-Host "GitHub: https://github.com/jojerd/EntraAdDeviceCleanup" -ForegroundColor Yellow
     Write-Host ""
 }
+# Write Log Function. Writes to screen during interactive mode and to a log file during command line execution.
 Function Write-Log {
     param(
         [Parameter(Mandatory)]
@@ -109,7 +157,9 @@ Function Write-Log {
         - Add: Device.Read.All, Device.ReadWrite.All
     11. Click "Grant admin consent" for your organization.
 #>
-
+# Connect to Graph API using device code.
+# Requires ClientId and TenantId.
+# Note: This is useful for interactive scenarios where user consent is required.
 Function Connect-GraphWithDeviceCode {
     param(
         [Parameter(Mandatory)]
@@ -128,6 +178,9 @@ Function Connect-GraphWithDeviceCode {
         return $false
     }
 }
+# Connect to Graph API using service principal.
+# Requires ClientId, TenantId, and ClientSecret.
+# Note: This is useful for automated scripts where user interaction is not possible.
 Function Connect-GraphWithServicePrincipal {
     param(
         [Parameter(Mandatory)]
@@ -148,6 +201,8 @@ Function Connect-GraphWithServicePrincipal {
         return $false
     }
 }
+# Check if the required modules are installed and import them.
+# If not installed, attempt to install them.
 Function Initialize-RequiredModules {
     try {
         foreach ($module in $script:Config.ModuleRequirements.Keys) {
@@ -171,7 +226,8 @@ Function Initialize-RequiredModules {
         return $false
     }
 }
-
+# Show a GUI form for selecting operations.
+# This is used when the script is run in GUI mode.
 Function Show-MenuForm {
     Add-Type -AssemblyName System.Windows.Forms
     $MenuForm = New-Object System.Windows.Forms.Form
@@ -277,6 +333,9 @@ if ($PSCmdlet.ParameterSetName -eq 'CommandLine') {
         }
     }
 }
+# Initialize Graph connection
+# This function will handle device code and service principal authentication as well as interactive login.
+# It will also check if the required permissions are granted.
 Function Initialize-GraphConnection {
     try {
         $null = Invoke-WebRequest -Uri https://adminwebservice.microsoftonline.com/ProvisioningService.svc -ErrorAction Stop
@@ -301,6 +360,8 @@ Function Initialize-GraphConnection {
         return $false
     }
 }
+# Function to retrieve stale devices based on the configured threshold.
+# It filters devices based on their last sign-in date and whether they are disabled.
 Function Get-StaleDevices {
     param(
         [bool]$OnlyDisabled = $false
@@ -323,7 +384,8 @@ Function Get-StaleDevices {
         return $null
     }
 }
-
+# Function to export device report to Excel.
+# It formats the device data and saves it to an Excel file.
 Function Export-DeviceReport {
     param(
         [Parameter(Mandatory)]
@@ -394,7 +456,8 @@ Function Export-DeviceReport {
         return $null
     }
 }
-
+# Function to perform device operations (list, disable, remove).
+# It retrieves stale devices and performs the specified operation on them.
 Function Invoke-DeviceOperation {
     param(
         [Parameter(Mandatory)]
@@ -464,6 +527,8 @@ Function Invoke-DeviceOperation {
 }
 
 # Main script execution logic
+# This section handles both GUI and command-line modes.
+# It initializes required modules, connects to Graph API, and executes the requested operation.   
 try {
     Clear-Host
     Show-Header
