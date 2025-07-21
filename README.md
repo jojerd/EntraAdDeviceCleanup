@@ -22,6 +22,7 @@ For more information, please visit: https://docs.microsoft.com/en-us/azure/activ
 # Script Execution Methods
 Executing as a single use, you are presented with a pop-up of options to select as well as the default threshold of 90 days.
 90 day threshold can be changed with a custom threshold to whatever works best for you when dealing with stale devices.
+
 <img width="377" height="300" alt="image" src="https://github.com/user-attachments/assets/3b4fe7b5-00d9-46de-bc5b-3fa33e450255" />
 
 # Device Code Flow Execution
