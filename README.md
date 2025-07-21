@@ -23,3 +23,25 @@ For more information, please visit: https://docs.microsoft.com/en-us/azure/activ
 Executing as a single use, you are presented with a pop-up of options to select as well as the default threshold of 90 days.
 90 day threshold can be changed with a custom threshold to whatever works best for you when dealing with stale devices.
 <img width="377" height="300" alt="image" src="https://github.com/user-attachments/assets/3b4fe7b5-00d9-46de-bc5b-3fa33e450255" />
+
+# Device Code Flow Execution
+
+.\EntraAdDeviceCleanup.ps1 -Operation Verify -UseDeviceCode -ClientID "Your-Client-Id" -TenantId "You-Tenant-Id"
+
+# Service Principal Execution
+This is used for an automated scheduled task. When wanting to perform a clean you must use the -Force switch in the command line as I am asking for confirmation on removal during interactive execution and -force bypasses that.
+
+.\EntraAdDeviceCleanup.ps1 -Operation Verify -Threshold 90 -ClientId "Your-Client-Id" -TenantId "Your-Tenant-Id" -ClientSecret "Your-Client-Secret"
+
+To clean a device via service principal scheduled task
+
+.\EntraAdDeviceCleanup.ps1 -Operation CleanDevices -Force -threshold 90 -ClientId "Your-Client-Id" -TenantId "Your-Tenant-Id" -ClientSecret "Your-Client-Secret"
+
+# Command Line
+
+The script can be execute via command line for all options listed in the screen shot above. Just make sure to include -Operation with desired switch (Verify, VerifyDisabledDevices, DisableDevices, CleanDisabledDevices, CleanDevices)
+
+# Logging
+
+The script has the same capability and requirement to use ImportExcel to output stale and disabled devices depending on switch that is used.
+It also creates a transcript for troubleshooting purposes as well as actions taken via Write-Log function that writes to the screen during interactive or writes to a log file when executed via command line.
