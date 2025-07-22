@@ -146,7 +146,7 @@ Function Show-Header {
     # Environment information
     Write-Host "Environment Information:" -ForegroundColor Cyan
     Write-Host "PowerShell Version: $($PSVersionTable.PSVersion)" -ForegroundColor White
-    Write-Host "OS: $($PSVersionTable.OS)" -ForegroundColor White
+    Write-Host "OS: $((Get-CimInstance Win32_OperatingSystem).Caption) $((Get-CimInstance Win32_OperatingSystem).Version)" -ForegroundColor White
     if ($PSCmdlet.ParameterSetName -eq 'CommandLine' -and $UseParallel) {
         Write-Host "Parallel Processing: Enabled (Throttle: $ThrottleLimit)" -ForegroundColor Green
     }
