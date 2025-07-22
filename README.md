@@ -10,6 +10,16 @@ https://techcommunity.microsoft.com/blog/microsoft-entra-blog/action-required-ms
 
 3.) Added additional functions and features into this utility after re-writing it to support Microsoft Graph connectivity. (Device Code flow, and Service Principal sign-in support.)
 
+4.) Support for multithreaded operations for large operations (1000+ devices).
+
+As an example:
+
+Sequential:
+1000 devices ≈ 15-30 minutes
+
+Parallel (10 threads): 
+1000 devices ≈ 3-5 minutes
+
 # Very Important Notes
 This source code is freeware and is provided on an "as is" basis without warranties of any kind, whether express or implied, including without limitation warranties that the code is free of defect, fit for a particular purpose or non-infringing. The entire risk as to the quality and performance of the code is with the end user.
 
@@ -23,7 +33,11 @@ For more information, please visit: https://docs.microsoft.com/en-us/azure/activ
 Executing as a single use, you are presented with a pop-up of options to select as well as the default threshold of 90 days.
 90 day threshold can be changed with a custom threshold to whatever works best for you when dealing with stale devices.
 
-<img width="377" height="300" alt="image" src="https://github.com/user-attachments/assets/3b4fe7b5-00d9-46de-bc5b-3fa33e450255" />
+<img width="395" height="386" alt="image" src="https://github.com/user-attachments/assets/a112e787-5bc1-4368-a305-e0379816c655" />
+
+# Multithreaded Operation 
+Multithreaded operations can be set via GUI as well as Command line. The script will also automatically choose multithreaded (Parellel) operations if more than 25 devices are returned during initial lookup.
+
 
 # Device Code Flow Execution
 
@@ -38,9 +52,14 @@ To clean a device via service principal scheduled task
 
 .\EntraAdDeviceCleanup.ps1 -Operation CleanDevices -Force -threshold 90 -ClientId "Your-Client-Id" -TenantId "Your-Tenant-Id" -ClientSecret "Your-Client-Secret"
 
+Parallel Processing
+
+.\EntraAdDeviceCleanup.ps1 -Operation CleanDevices -Force -threshold 90 -UseParallel -ThrottleLimit 15 -ClientId "Your-Client-Id" -TenantId "Your-Tenant-Id" -ClientSecret "Your-Client-Secret"
+
 # Command Line
 
 The script can be executed via command line for all options listed in the screen shot above. Just make sure to include -Operation with the desired switch (Verify, VerifyDisabledDevices, DisableDevices, CleanDisabledDevices, CleanDevices)
+
 
 # Logging
 
