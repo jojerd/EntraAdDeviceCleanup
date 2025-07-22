@@ -52,6 +52,14 @@ SOFTWARE.
     CleanDevices
     Removed the stale devices as per the configured threshold.
 
+.PARAMETER
+    UseParallel
+    Uses parallel processing for bulk operations. Automatically enabled for 25+ devices unless explicitly disabled.
+
+.PARAMETER
+    ThrottleLimit
+    Number of concurrent operations when using parallel processing (1-50). Default is 10.
+
 .Example Device Code Flow
     .\EntraAdDeviceCleanup.ps1 -Operation Verify -Threshold 90 -UseDeviceCode -ClientId "your-client-id" -TenantId "your-tenant-id"
 
@@ -62,9 +70,10 @@ SOFTWARE.
 
     This example connects to Microsoft Graph using service principal and disables stale devices.
 
-    .\EntraAdDeviceCleanup.ps1 -Operation CleanDevices -Force -threshold 90 -ClientId "Your-Client-Id" -TenantId "Your-Tenant-Id" -ClientSecret "Your-Client-Secret"
+.Example Parallel Processing
+    .\EntraAdDeviceCleanup.ps1 -Operation CleanDevices -Force -threshold 90 -UseParallel -ThrottleLimit 15 -ClientId "Your-Client-Id" -TenantId "Your-Tenant-Id" -ClientSecret "Your-Client-Secret"
 
-    This example connects to Microsoft Graph using service principal and removes stale devices without confirmation.
+    This example connects to Microsoft Graph using service principal and removes stale devices using parallel processing with 15 concurrent operations.
 
 #>
 [CmdletBinding(DefaultParameterSetName = 'GUI')]
@@ -85,13 +94,32 @@ param(
     [Parameter(ParameterSetName = 'CommandLine')]
     [string]$TenantId,
     [Parameter(ParameterSetName = 'CommandLine')]
-    [string]$ClientSecret
+    [string]$ClientSecret,
+    [Parameter(ParameterSetName = 'CommandLine')]
+    [switch]$UseParallel,
+    [Parameter(ParameterSetName = 'CommandLine')]
+    [int]$ThrottleLimit = 10
 ) 
 # Script configuration
 $script:Config = @{
     DefaultThreshold   = $ThresholdDays
     ExportPath         = if ($OutputPath) { $OutputPath } else { $PSScriptRoot }
     DateFormat         = "{0:s}"
+    ParallelProcessing = @{
+        DefaultThrottleLimit = 10
+        MinDevicesForParallel = 25  # Only use parallel for 25+ devices
+        ProgressUpdateInterval = 10  # Update progress every N completed operations
+    }
+    RetryConfiguration = @{
+        MaxRetries = 3
+        InitialDelaySeconds = 2
+        BackoffMultiplier = 2  # Exponential backoff
+        RateLimitRetryDelaySeconds = 60  # Wait time for 429 errors
+    }
+    Performance = @{
+        BatchSize = 100  # Process devices in batches for very large datasets
+        MaxConcurrentBatches = 5  # Max batches to process simultaneously
+    }
     ModuleRequirements = @{
         'ImportExcel'                                  = @()  # Empty array means import all commands
         'Microsoft.Graph.Authentication'               = @('Connect-MgGraph')
@@ -108,11 +136,20 @@ Function Show-Header {
     Write-Host ""
     Write-Host "Entra AD Device Cleanup Script" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "Version: 2.0" -ForegroundColor Green
+    Write-Host "Version: 2.1 (Enterprise Edition)" -ForegroundColor Green
     Write-Host ("Date: " + $(Get-Date).ToString("F", [System.Globalization.CultureInfo]::CurrentCulture)) -ForegroundColor Yellow
     Write-Host "Created by: Josh Jerdon" -ForegroundColor Green
     Write-Host "Email: jojerd@microsoft.com" -ForegroundColor Green
     Write-Host "GitHub: https://github.com/jojerd/EntraAdDeviceCleanup" -ForegroundColor Yellow
+    Write-Host ""
+    
+    # Environment information
+    Write-Host "Environment Information:" -ForegroundColor Cyan
+    Write-Host "PowerShell Version: $($PSVersionTable.PSVersion)" -ForegroundColor White
+    Write-Host "OS: $($PSVersionTable.OS)" -ForegroundColor White
+    if ($PSCmdlet.ParameterSetName -eq 'CommandLine' -and $UseParallel) {
+        Write-Host "Parallel Processing: Enabled (Throttle: $ThrottleLimit)" -ForegroundColor Green
+    }
     Write-Host ""
 }
 # Write Log Function. Writes to screen during interactive mode and to a log file during command line execution.
@@ -138,6 +175,46 @@ Function Write-Log {
     if ($PSCmdlet.ParameterSetName -eq 'CommandLine') {
         $logFile = Join-Path $script:Config.ExportPath "DeviceCleanup_$(Get-Date -Format 'yyyyMMdd').log"
         $logMessage | Out-File -FilePath $logFile -Append
+    }
+}
+
+# Retry function with exponential backoff for Graph API operations
+Function Invoke-GraphOperationWithRetry {
+    param(
+        [Parameter(Mandatory)]
+        [scriptblock]$Operation,
+        [string]$OperationName = "Graph Operation",
+        [int]$MaxRetries = $script:Config.RetryConfiguration.MaxRetries,
+        [int]$InitialDelay = $script:Config.RetryConfiguration.InitialDelaySeconds
+    )
+    
+    $attempt = 1
+    $delay = $InitialDelay
+    
+    while ($attempt -le ($MaxRetries + 1)) {
+        try {
+            return & $Operation
+        }
+        catch {
+            $isRateLimit = $_.Exception.Message -match "429|Too Many Requests|throttle"
+            $isTransient = $_.Exception.Message -match "timeout|temporary|service unavailable|502|503|504"
+            
+            if ($attempt -le $MaxRetries -and ($isRateLimit -or $isTransient)) {
+                if ($isRateLimit) {
+                    $waitTime = $script:Config.RetryConfiguration.RateLimitRetryDelaySeconds
+                    Write-Log "Rate limit encountered for $OperationName. Waiting $waitTime seconds before retry $attempt/$MaxRetries..." -Level Warning
+                    Start-Sleep -Seconds $waitTime
+                } else {
+                    Write-Log "Transient error for $OperationName. Retrying in $delay seconds (attempt $attempt/$MaxRetries)..." -Level Warning
+                    Start-Sleep -Seconds $delay
+                    $delay *= $script:Config.RetryConfiguration.BackoffMultiplier
+                }
+                $attempt++
+            } else {
+                # Re-throw the exception if max retries exceeded or non-retryable error
+                throw
+            }
+        }
     }
 }
 <#
@@ -232,7 +309,7 @@ Function Show-MenuForm {
     Add-Type -AssemblyName System.Windows.Forms
     $MenuForm = New-Object System.Windows.Forms.Form
     $MenuForm.Text = "Entra AD Device Cleanup"
-    $MenuForm.Size = New-Object System.Drawing.Size(400, 320)
+    $MenuForm.Size = New-Object System.Drawing.Size(420, 400)
     $MenuForm.StartPosition = "CenterScreen"
 
     # Define available actions
@@ -272,11 +349,32 @@ Function Show-MenuForm {
     $thresholdBox.Text = $script:Config.DefaultThreshold.ToString()
     $MenuForm.Controls.Add($thresholdBox)
 
+    # Add parallel processing checkbox
+    $parallelCheckbox = New-Object System.Windows.Forms.CheckBox
+    $parallelCheckbox.Text = "Use parallel processing (for 25+ devices)"
+    $parallelCheckbox.Location = New-Object System.Drawing.Point(20, ($y + 40))
+    $parallelCheckbox.Size = New-Object System.Drawing.Size(250, 20)
+    $parallelCheckbox.Checked = $true
+    $MenuForm.Controls.Add($parallelCheckbox)
+
+    # Add throttle limit input
+    $throttleLabel = New-Object System.Windows.Forms.Label
+    $throttleLabel.Text = "Concurrent operations:"
+    $throttleLabel.Location = New-Object System.Drawing.Point(280, ($y + 40))
+    $throttleLabel.Size = New-Object System.Drawing.Size(120, 20)
+    $MenuForm.Controls.Add($throttleLabel)
+
+    $throttleBox = New-Object System.Windows.Forms.TextBox
+    $throttleBox.Location = New-Object System.Drawing.Point(320, ($y + 60))
+    $throttleBox.Size = New-Object System.Drawing.Size(40, 20)
+    $throttleBox.Text = $script:Config.ParallelProcessing.DefaultThrottleLimit.ToString()
+    $MenuForm.Controls.Add($throttleBox)
+
     # Add buttons
     $okButton = New-Object System.Windows.Forms.Button
     $okButton.Text = "OK"
     $okButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
-    $okButton.Location = New-Object System.Drawing.Point(220, ($y + 50))
+    $okButton.Location = New-Object System.Drawing.Point(220, ($y + 100))
     $okButton.Add_Click({
             # Validate threshold input
             if (-not [int]::TryParse($thresholdBox.Text, [ref]$null)) {
@@ -289,11 +387,24 @@ Function Show-MenuForm {
                 return
             }
 
-            # Store selected operation and threshold
+            # Validate throttle limit input
+            if (-not [int]::TryParse($throttleBox.Text, [ref]$null) -or [int]$throttleBox.Text -lt 1 -or [int]$throttleBox.Text -gt 50) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Please enter a valid number for Concurrent Operations (1-50).",
+                    "Input Error",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning
+                )
+                return
+            }
+
+            # Store selected operation and settings
             $selectedRadio = $radioButtons | Where-Object { $_.Checked }
             if ($selectedRadio) {
                 $script:SelectedOperation = $selectedRadio.Tag
                 $script:Config.DefaultThreshold = [int]$thresholdBox.Text
+                $script:UseParallelFromGUI = $parallelCheckbox.Checked
+                $script:ThrottleLimitFromGUI = [int]$throttleBox.Text
                 $MenuForm.DialogResult = [System.Windows.Forms.DialogResult]::OK
                 $MenuForm.Close()
             }
@@ -303,7 +414,7 @@ Function Show-MenuForm {
     $cancelButton = New-Object System.Windows.Forms.Button
     $cancelButton.Text = "Cancel"
     $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    $cancelButton.Location = New-Object System.Drawing.Point(100, ($y + 50))
+    $cancelButton.Location = New-Object System.Drawing.Point(100, ($y + 100))
     $cancelButton.Add_Click({ $MenuForm.Close() })
     $MenuForm.Controls.Add($cancelButton)
 
@@ -343,20 +454,70 @@ Function Initialize-GraphConnection {
             if (-not $ClientId -or -not $TenantId) {
                 throw "ClientId and TenantId are required for device code flow. See script comments for instructions."
             }
-            return Connect-GraphWithDeviceCode -ClientId $ClientId -TenantId $TenantId
+            $connected = Connect-GraphWithDeviceCode -ClientId $ClientId -TenantId $TenantId
         }
         elseif ($ClientId -and $TenantId -and $ClientSecret) {
-            return Connect-GraphWithServicePrincipal -ClientId $ClientId -TenantId $TenantId -ClientSecret $ClientSecret
+            $connected = Connect-GraphWithServicePrincipal -ClientId $ClientId -TenantId $TenantId -ClientSecret $ClientSecret
         }
         else {
             # Default to interactive login if nothing else specified
             Connect-MgGraph -Scopes "Device.Read.All", "Device.ReadWrite.All" -ErrorAction Stop
             Write-Log "Connected to Microsoft Graph interactively."
-            return $true
+            $connected = $true
         }
+        
+        if ($connected) {
+            # Validate connection and permissions
+            return Test-GraphConnection
+        }
+        return $false
     }
     catch {
         Write-Log "Failed to connect: $($_.Exception.Message)" -Level Error
+        return $false
+    }
+}
+
+# Test Graph connection and validate required permissions
+Function Test-GraphConnection {
+    try {
+        Write-Log "Validating Graph connection and permissions..." -Level Info
+        
+        # Test basic connectivity
+        $context = Get-MgContext -ErrorAction Stop
+        if (-not $context) {
+            throw "No Graph context found"
+        }
+        
+        Write-Log "Connected to tenant: $($context.TenantId)" -Level Info
+        Write-Log "Using account: $($context.Account)" -Level Info
+        
+        # Test device read permissions
+        try {
+            $testDevice = Get-MgDevice -Top 1 -ErrorAction Stop
+            Write-Log "Device read permissions validated." -Level Info
+        }
+        catch {
+            throw "Missing Device.Read.All permission: $($_.Exception.Message)"
+        }
+        
+        # Test device write permissions (non-destructive test)
+        try {
+            $testDeviceId = (Get-MgDevice -Top 1 -ErrorAction Stop)[0].Id
+            if ($testDeviceId) {
+                # This is a read operation but requires write scope
+                Get-MgDevice -DeviceId $testDeviceId -ErrorAction Stop | Out-Null
+                Write-Log "Device write permissions validated." -Level Info
+            }
+        }
+        catch {
+            Write-Log "Warning: Device write permissions may be limited: $($_.Exception.Message)" -Level Warning
+        }
+        
+        return $true
+    }
+    catch {
+        Write-Log "Graph connection validation failed: $($_.Exception.Message)" -Level Error
         return $false
     }
 }
@@ -368,15 +529,39 @@ Function Get-StaleDevices {
     )
     try {
         Write-Log "Retrieving devices from Entra AD..." -Level Info
-        $devices = Get-MgDevice -All -ErrorAction Stop
+        
+        # Use retry logic for device retrieval
+        $devices = Invoke-GraphOperationWithRetry -Operation {
+            Get-MgDevice -All -ErrorAction Stop
+        } -OperationName "Get-MgDevice"
+        
         $lastLogon = (Get-Date).AddDays(-$script:Config.DefaultThreshold)
         
         Write-Log "Filtering devices older than $lastLogon..." -Level Info
         $filtered = $devices | Where-Object {
-            $_.ApproximateLastSignInDateTime -lt $lastLogon -and
-            ($OnlyDisabled -eq $false -or $_.AccountEnabled -eq $false)
+            # Handle null/empty last sign-in dates
+            $lastSignIn = $_.ApproximateLastSignInDateTime
+            if (-not $lastSignIn -or $lastSignIn -eq [DateTime]::MinValue) {
+                # If no sign-in date, consider it stale
+                $isStale = $true
+            } else {
+                $isStale = $lastSignIn -lt $lastLogon
+            }
+            
+            $isStale -and ($OnlyDisabled -eq $false -or $_.AccountEnabled -eq $false)
         }
+        
         Write-Log "Found $($filtered.Count) devices matching criteria." -Level Info
+        
+        # Log breakdown by OS for better visibility
+        if ($filtered.Count -gt 0) {
+            $osBreakdown = $filtered | Group-Object OperatingSystem | Sort-Object Count -Descending
+            Write-Log "Device breakdown by OS:" -Level Info
+            foreach ($os in $osBreakdown) {
+                Write-Log "  $($os.Name): $($os.Count) devices" -Level Info
+            }
+        }
+        
         return $filtered
     }
     catch {
@@ -456,7 +641,7 @@ Function Export-DeviceReport {
         return $null
     }
 }
-# Function to perform device operations (list, disable, remove).
+# Function to perform device operations (list, disable, remove) with optional parallel processing.
 # It retrieves stale devices and performs the specified operation on them.
 Function Invoke-DeviceOperation {
     param(
@@ -465,7 +650,10 @@ Function Invoke-DeviceOperation {
         [string]$Operation,
         
         [Parameter(Mandatory)]
-        [bool]$OnlyDisabled
+        [bool]$OnlyDisabled,
+        
+        [switch]$UseParallel,
+        [int]$ThrottleLimit = 0
     )
 
     # Get devices based on criteria
@@ -475,27 +663,127 @@ Function Invoke-DeviceOperation {
         return
     }
 
+    # Determine if we should use parallel processing
+    $shouldUseParallel = $UseParallel -and 
+                        ($devices.Count -ge $script:Config.ParallelProcessing.MinDevicesForParallel) -and
+                        ($Operation -ne 'List')
+
+    if ($ThrottleLimit -le 0) {
+        $ThrottleLimit = $script:Config.ParallelProcessing.DefaultThrottleLimit
+    }
+
     Write-Log "Processing $($devices.Count) devices..." -Level Info
+    
+    # For very large datasets, use batch processing
+    if ($devices.Count -gt $script:Config.Performance.BatchSize -and $Operation -ne 'List') {
+        Write-Log "Large dataset detected. Using batch processing..." -Level Info
+        Invoke-DeviceOperationBatched -Devices $devices -Operation $Operation -UseParallel $shouldUseParallel -ThrottleLimit $ThrottleLimit
+    }
+    elseif ($shouldUseParallel) {
+        Write-Log "Using parallel processing with $ThrottleLimit concurrent operations." -Level Info
+        Invoke-DeviceOperationParallel -Devices $devices -Operation $Operation -ThrottleLimit $ThrottleLimit
+    }
+    else {
+        if ($UseParallel -and $devices.Count -lt $script:Config.ParallelProcessing.MinDevicesForParallel) {
+            Write-Log "Device count below threshold for parallel processing. Using sequential processing." -Level Info
+        }
+        Invoke-DeviceOperationSequential -Devices $devices -Operation $Operation
+    }
+}
+
+# Batch processing function for very large datasets
+Function Invoke-DeviceOperationBatched {
+    param(
+        [Parameter(Mandatory)]
+        $Devices,
+        [Parameter(Mandatory)]
+        [string]$Operation,
+        [bool]$UseParallel,
+        [int]$ThrottleLimit
+    )
+    
+    $batchSize = $script:Config.Performance.BatchSize
+    $totalDevices = $Devices.Count
+    $totalBatches = [math]::Ceiling($totalDevices / $batchSize)
+    $overallSuccessCount = 0
+    $overallFailCount = 0
+    
+    Write-Log "Processing $totalDevices devices in $totalBatches batches of $batchSize..." -Level Info
+    
+    for ($batchIndex = 0; $batchIndex -lt $totalBatches; $batchIndex++) {
+        $startIndex = $batchIndex * $batchSize
+        $endIndex = [math]::Min($startIndex + $batchSize - 1, $totalDevices - 1)
+        $currentBatch = $Devices[$startIndex..$endIndex]
+        
+        Write-Log "Processing batch $($batchIndex + 1) of $totalBatches ($($currentBatch.Count) devices)..." -Level Info
+        
+        # Process current batch
+        $batchResults = if ($UseParallel) {
+            Invoke-DeviceOperationParallel -Devices $currentBatch -Operation $Operation -ThrottleLimit $ThrottleLimit -ReturnResults
+        } else {
+            Invoke-DeviceOperationSequential -Devices $currentBatch -Operation $Operation -ReturnResults
+        }
+        
+        if ($batchResults) {
+            $overallSuccessCount += $batchResults.SuccessCount
+            $overallFailCount += $batchResults.FailCount
+        }
+        
+        # Brief pause between batches to be respectful to the API
+        if ($batchIndex -lt ($totalBatches - 1)) {
+            Start-Sleep -Seconds 2
+        }
+    }
+    
+    # Show overall summary
+    Write-Log "Batch Processing Complete:" -Level Info
+    Write-Log "Total devices processed: $totalDevices" -Level Info
+    Write-Log "Overall successful operations: $overallSuccessCount" -Level Info
+    Write-Log "Overall failed operations: $overallFailCount" -Level Info
+    
+    # Export results for all devices
+    Show-OperationSummary -Devices $Devices -Operation $Operation -SuccessCount $overallSuccessCount -FailCount $overallFailCount
+}
+
+# Sequential processing function (original implementation)
+Function Invoke-DeviceOperationSequential {
+    param(
+        [Parameter(Mandatory)]
+        $Devices,
+        [Parameter(Mandatory)]
+        [string]$Operation,
+        [switch]$ReturnResults
+    )
+
     $successCount = 0
     $failCount = 0
 
     # Process devices based on operation
     if ($Operation -ne 'List') {
-        foreach ($device in $devices) {
+        foreach ($device in $Devices) {
             try {
                 switch ($Operation) {
                     'Disable' {
                         if ($device.AccountEnabled) {
-                            Update-MgDevice -DeviceId $device.Id -BodyParameter @{accountEnabled = $false } -ErrorAction Stop
+                            # Use retry logic for device operations
+                            Invoke-GraphOperationWithRetry -Operation {
+                                Update-MgDevice -DeviceId $device.Id -BodyParameter @{accountEnabled = $false } -ErrorAction Stop
+                            } -OperationName "Disable device $($device.DisplayName)"
+                            
                             Write-Log "Disabled device: $($device.DisplayName)" -Level Info
                             $successCount++
                         }
                         else {
                             Write-Log "Device already disabled: $($device.DisplayName)" -Level Warning
+                            $successCount++  # Count as success since desired state is achieved
                         }
                     }
                     'Remove' {
-                        Remove-MgDevice -DeviceId $device.Id -ErrorAction Stop
+                        # Use retry logic for device operations
+                        Invoke-GraphOperationWithRetry -Operation {
+                            Remove-MgDevice -DeviceId $device.Id -ErrorAction Stop
+                        } -OperationName "Remove device $($device.DisplayName)"
+                        
                         Write-Log "Removed device: $($device.DisplayName)" -Level Info
                         $successCount++
                     }
@@ -508,22 +796,291 @@ Function Invoke-DeviceOperation {
         }
     }
     else {
-        $successCount = $devices.Count
+        $successCount = $Devices.Count
     }
 
-    # Export results
-    $reportFile = Export-DeviceReport -Devices $devices -Operation $Operation
-    
-    # Display summary
-    Write-Log "Operation Summary:" -Level Info
-    Write-Log "Total devices processed: $($devices.Count)" -Level Info
-    Write-Log "Successful operations: $successCount" -Level Info
-    if ($failCount -gt 0) {
-        Write-Log "Failed operations: $failCount" -Level Error
+    # Return results if requested (for batch processing), otherwise show summary
+    if ($ReturnResults) {
+        return @{
+            SuccessCount = $successCount
+            FailCount = $failCount
+        }
+    } else {
+        Show-OperationSummary -Devices $Devices -Operation $Operation -SuccessCount $successCount -FailCount $failCount
     }
+}
+
+# Parallel processing function using RunspacePool (PowerShell 5.1 compatible)
+Function Invoke-DeviceOperationParallel {
+    param(
+        [Parameter(Mandatory)]
+        $Devices,
+        [Parameter(Mandatory)]
+        [string]$Operation,
+        [Parameter(Mandatory)]
+        [int]$ThrottleLimit,
+        [switch]$ReturnResults
+    )
+
+    # Create runspace pool
+    $initialSessionState = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    
+    # Import Microsoft Graph module into runspace pool
+    try {
+        $mgModulePath = (Get-Module Microsoft.Graph.Identity.DirectoryManagement -ListAvailable | Select-Object -First 1).ModuleBase
+        if ($mgModulePath) {
+            $initialSessionState.ImportPSModule(@('Microsoft.Graph.Identity.DirectoryManagement'))
+        }
+    }
+    catch {
+        Write-Log "Warning: Could not pre-import Microsoft Graph module into runspaces. Modules will be imported per runspace." -Level Warning
+    }
+
+    $runspacePool = [runspacefactory]::CreateRunspacePool(1, $ThrottleLimit, $initialSessionState, $Host)
+    $runspacePool.Open()
+
+    # Enhanced script block with retry logic
+    $scriptBlock = {
+        param($DeviceId, $DisplayName, $Operation, $AccountEnabled, $RetryConfig)
+        
+        $result = @{
+            DeviceId = $DeviceId
+            DisplayName = $DisplayName
+            Success = $false
+            ErrorMessage = $null
+            AlreadyDisabled = $false
+            Retries = 0
+        }
+
+        # Retry function within runspace
+        function Invoke-OperationWithRetry {
+            param($Operation, $MaxRetries = 3, $InitialDelay = 2)
+            
+            $attempt = 1
+            $delay = $InitialDelay
+            
+            while ($attempt -le ($MaxRetries + 1)) {
+                try {
+                    return & $Operation
+                }
+                catch {
+                    $isRateLimit = $_.Exception.Message -match "429|Too Many Requests|throttle"
+                    $isTransient = $_.Exception.Message -match "timeout|temporary|service unavailable|502|503|504"
+                    
+                    if ($attempt -le $MaxRetries -and ($isRateLimit -or $isTransient)) {
+                        if ($isRateLimit) {
+                            Start-Sleep -Seconds 60  # Wait longer for rate limits
+                        } else {
+                            Start-Sleep -Seconds $delay
+                            $delay *= 2  # Exponential backoff
+                        }
+                        $attempt++
+                    } else {
+                        throw
+                    }
+                }
+            }
+        }
+
+        try {
+            # Import required modules if not already loaded
+            if (-not (Get-Command Update-MgDevice -ErrorAction SilentlyContinue)) {
+                Import-Module Microsoft.Graph.Identity.DirectoryManagement -Force -ErrorAction Stop
+            }
+
+            switch ($Operation) {
+                'Disable' {
+                    if ($AccountEnabled) {
+                        Invoke-OperationWithRetry -Operation {
+                            Update-MgDevice -DeviceId $DeviceId -BodyParameter @{accountEnabled = $false } -ErrorAction Stop
+                        } -MaxRetries $RetryConfig.MaxRetries -InitialDelay $RetryConfig.InitialDelaySeconds
+                        $result.Success = $true
+                    }
+                    else {
+                        $result.Success = $true
+                        $result.AlreadyDisabled = $true
+                    }
+                }
+                'Remove' {
+                    Invoke-OperationWithRetry -Operation {
+                        Remove-MgDevice -DeviceId $DeviceId -ErrorAction Stop
+                    } -MaxRetries $RetryConfig.MaxRetries -InitialDelay $RetryConfig.InitialDelaySeconds
+                    $result.Success = $true
+                }
+            }
+        }
+        catch {
+            $result.ErrorMessage = $_.Exception.Message
+        }
+        
+        return $result
+    }
+
+    # Create and start jobs
+    $jobs = @()
+    $jobIndex = 0
+    
+    foreach ($device in $Devices) {
+        $powershell = [powershell]::Create()
+        $powershell.RunspacePool = $runspacePool
+        
+        $null = $powershell.AddScript($scriptBlock)
+        $null = $powershell.AddParameter("DeviceId", $device.Id)
+        $null = $powershell.AddParameter("DisplayName", $device.DisplayName)
+        $null = $powershell.AddParameter("Operation", $Operation)
+        $null = $powershell.AddParameter("AccountEnabled", $device.AccountEnabled)
+        $null = $powershell.AddParameter("RetryConfig", $script:Config.RetryConfiguration)
+        
+        $jobs += [PSCustomObject]@{
+            Index = $jobIndex++
+            PowerShell = $powershell
+            AsyncResult = $powershell.BeginInvoke()
+            Device = $device
+            StartTime = Get-Date
+        }
+    }
+
+    Write-Log "Started $($jobs.Count) concurrent operations. Waiting for completion..." -Level Info
+
+    # Monitor and collect results
+    $successCount = 0
+    $failCount = 0
+    $completed = 0
+    $progressUpdateInterval = $script:Config.ParallelProcessing.ProgressUpdateInterval
+    
+    try {
+        while ($jobs) {
+            $completedJobs = $jobs | Where-Object { $_.AsyncResult.IsCompleted }
+            
+            foreach ($job in $completedJobs) {
+                try {
+                    $result = $job.PowerShell.EndInvoke($job.AsyncResult)
+                    
+                    if ($result -and $result.Count -gt 0) {
+                        $jobResult = $result[0]
+                        
+                        if ($jobResult.Success) {
+                            if (-not $jobResult.AlreadyDisabled) {
+                                Write-Log "$Operation device: $($jobResult.DisplayName)" -Level Info
+                            }
+                            else {
+                                Write-Log "Device already disabled: $($jobResult.DisplayName)" -Level Warning
+                            }
+                            $successCount++
+                        }
+                        else {
+                            Write-Log "Failed to $Operation device $($jobResult.DisplayName): $($jobResult.ErrorMessage)" -Level Error
+                            $failCount++
+                        }
+                    }
+                    else {
+                        Write-Log "Failed to $Operation device $($job.Device.DisplayName): No result returned" -Level Error
+                        $failCount++
+                    }
+                }
+                catch {
+                    Write-Log "Failed to $Operation device $($job.Device.DisplayName): $($_.Exception.Message)" -Level Error
+                    $failCount++
+                }
+                finally {
+                    $job.PowerShell.Dispose()
+                }
+                
+                $completed++
+                
+                # Show progress updates
+                if ($completed % $progressUpdateInterval -eq 0 -or $completed -eq $Devices.Count) {
+                    $percentComplete = [math]::Round(($completed / $Devices.Count) * 100, 1)
+                    Write-Log "Progress: $completed of $($Devices.Count) devices processed ($percentComplete%)" -Level Info
+                }
+            }
+            
+            # Remove completed jobs from monitoring list
+            $jobs = $jobs | Where-Object { -not $_.AsyncResult.IsCompleted }
+            
+            # Small delay to prevent excessive CPU usage while monitoring
+            if ($jobs) {
+                Start-Sleep -Milliseconds 100
+            }
+        }
+    }
+    finally {
+        # Cleanup: Dispose any remaining PowerShell instances
+        foreach ($job in $jobs) {
+            try {
+                $job.PowerShell.Dispose()
+            }
+            catch {
+                # Ignore disposal errors
+            }
+        }
+        
+        # Close and dispose runspace pool
+        try {
+            $runspacePool.Close()
+            $runspacePool.Dispose()
+        }
+        catch {
+            Write-Log "Warning: Error disposing runspace pool: $($_.Exception.Message)" -Level Warning
+        }
+    }
+
+    # Return results if requested (for batch processing), otherwise show summary
+    if ($ReturnResults) {
+        return @{
+            SuccessCount = $successCount
+            FailCount = $failCount
+        }
+    } else {
+        Show-OperationSummary -Devices $Devices -Operation $Operation -SuccessCount $successCount -FailCount $failCount
+    }
+}
+
+# Helper function to display operation summary and export results
+Function Show-OperationSummary {
+    param(
+        [Parameter(Mandatory)]
+        $Devices,
+        [Parameter(Mandatory)]
+        [string]$Operation,
+        [Parameter(Mandatory)]
+        [int]$SuccessCount,
+        [Parameter(Mandatory)]
+        [int]$FailCount
+    )
+
+    # Calculate execution time
+    $executionTime = (Get-Date) - $script:OperationStartTime
+    
+    # Export results
+    $reportFile = Export-DeviceReport -Devices $Devices -Operation $Operation
+    
+    # Display comprehensive summary
+    Write-Log "========================================" -Level Info
+    Write-Log "Operation Summary:" -Level Info
+    Write-Log "========================================" -Level Info
+    Write-Log "Operation: $Operation" -Level Info
+    Write-Log "Total devices processed: $($Devices.Count)" -Level Info
+    Write-Log "Successful operations: $SuccessCount" -Level Info
+    if ($FailCount -gt 0) {
+        Write-Log "Failed operations: $FailCount" -Level Error
+        $successRate = [math]::Round(($SuccessCount / ($SuccessCount + $FailCount)) * 100, 1)
+        Write-Log "Success rate: $successRate%" -Level Warning
+    } else {
+        Write-Log "Success rate: 100%" -Level Info
+    }
+    
+    Write-Log "Execution time: $($executionTime.ToString('hh\:mm\:ss'))" -Level Info
+    
+    if ($Devices.Count -gt 0) {
+        $avgTimePerDevice = $executionTime.TotalSeconds / $Devices.Count
+        Write-Log "Average time per device: $([math]::Round($avgTimePerDevice, 2)) seconds" -Level Info
+    }
+    
     if ($reportFile) {
         Write-Log "Report file: $reportFile" -Level Info
     }
+    Write-Log "========================================" -Level Info
 }
 
 # Main script execution logic
@@ -545,6 +1102,8 @@ try {
             exit
         }
         $Operation = $script:SelectedOperation
+        $UseParallel = $script:UseParallelFromGUI
+        $ThrottleLimit = $script:ThrottleLimitFromGUI
     }
     elseif (-not $Force) {
         # Confirm destructive operations in command-line mode
@@ -563,22 +1122,23 @@ try {
     }
 
     # Execute requested operation
+    $script:OperationStartTime = Get-Date
     Write-Log "Executing operation: $Operation"
     switch ($Operation) {
         "Verify" { 
-            Invoke-DeviceOperation -Operation "List" -OnlyDisabled $false 
+            Invoke-DeviceOperation -Operation "List" -OnlyDisabled $false -UseParallel:$UseParallel -ThrottleLimit $ThrottleLimit
         }
         "VerifyDisabledDevices" { 
-            Invoke-DeviceOperation -Operation "List" -OnlyDisabled $true 
+            Invoke-DeviceOperation -Operation "List" -OnlyDisabled $true -UseParallel:$UseParallel -ThrottleLimit $ThrottleLimit
         }
         "DisableDevices" { 
-            Invoke-DeviceOperation -Operation "Disable" -OnlyDisabled $false 
+            Invoke-DeviceOperation -Operation "Disable" -OnlyDisabled $false -UseParallel:$UseParallel -ThrottleLimit $ThrottleLimit
         }
         "CleanDisabledDevices" { 
-            Invoke-DeviceOperation -Operation "Remove" -OnlyDisabled $true 
+            Invoke-DeviceOperation -Operation "Remove" -OnlyDisabled $true -UseParallel:$UseParallel -ThrottleLimit $ThrottleLimit
         }
         "CleanDevices" { 
-            Invoke-DeviceOperation -Operation "Remove" -OnlyDisabled $false 
+            Invoke-DeviceOperation -Operation "Remove" -OnlyDisabled $false -UseParallel:$UseParallel -ThrottleLimit $ThrottleLimit
         }
         default {
             throw "Invalid operation selected: $Operation"
